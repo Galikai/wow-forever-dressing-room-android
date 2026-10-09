@@ -1,0 +1,124 @@
+name: Capture WoW Forever Character
+
+on:
+  workflow_dispatch:
+    inputs:
+      wowhead_url:
+        description: "Full Wowhead Forever Dressing Room URL"
+        required: true
+        type: string
+        default: "https://www.wowhead.com/forever/dressing-room#fo8zk0zJ89c8zw8ud8ot8uv8zI8Gq8qs8Mse8Mtk808zu8u38zG8Gc8qE8Mbs8dY8MDy877Q4P87Mv587o"
+  push:
+    branches: [main]
+    paths: [".github/workflows/capture-wowhead.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Install Playwright and Chromium
+        shell: bash
+        run: |
+          mkdir -p /tmp/wowhead-capture
+          cd /tmp/wowhead-capture
+          npm init -y >/dev/null
+          npm install --no-fund --no-audit playwright@1.55.1
+          npx playwright install --with-deps chromium
+
+      - name: Capture viewer and extract character settings
+        shell: bash
+        env:
+          TARGET_URL: ${{ inputs.wowhead_url || 'https://www.wowhead.com/forever/dressing-room#fo8zk0zJ89c8zw8ud8ot8uv8zI8Gq8qs8Mse8Mtk808zu8u38zG8Gc8qE8Mbs8dY8MDy877Q4P87Mv587o' }}
+        run: |
+          cd /tmp/wowhead-capture
+          node <<'JS'
+          const {chromium} = require('playwright');
+          const fs = require('fs');
+          const path = require('path');
+          const out = path.join(process.env.GITHUB_WORKSPACE, 'wow-capture');
+          fs.mkdirSync(out, {recursive: true});
+          const url = process.env.TARGET_URL;
+          const errors = [], requests = [];
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+          (async () => {
+            let browser;
+            try {
+              browser = await chromium.launch({headless:true, args:[
+                '--enable-webgl', '--ignore-gpu-blocklist',
+                '--use-gl=angle', '--use-angle=swiftshader',
+                '--enable-unsafe-swiftshader', '--disable-dev-shm-usage'
+              ]});
+              const context = await browser.newContext({
+                viewport:{width:1600,height:1100},deviceScaleFactor:1,
+                locale:'en-US'
+              });
+              const page = await context.newPage();
+              page.on('console', m => {if(m.type()==='error') errors.push(m.text().slice(0,400));});
+              page.on('pageerror', e => errors.push('PAGE: '+e.message.slice(0,400)));
+              page.on('requestfailed', r => requests.push({url:r.url().slice(0,250),error:r.failure()?.errorText}));
+              page.on('response', r => {if(r.status()>=400) requests.push({url:r.url().slice(0,250),status:r.status()});});
+              try { await page.goto(url, {waitUntil:'domcontentloaded',timeout:75000}); }
+              catch(e){ errors.push('NAVIGATION: '+e.message.slice(0,500)); }
+
+              for (const [i,ms] of [12000,20000,20000].entries()) {
+                await sleep(ms);
+                try {await page.screenshot({path:path.join(out,`0${i+1}-page.png`),fullPage:false,timeout:15000});}
+                catch(e){errors.push('SCREENSHOT: '+e.message.slice(0,300));}
+              }
+
+              const data = await page.evaluate(() => {
+                const c = [...document.querySelectorAll('canvas')].map((el,i)=>{
+                  const r=el.getBoundingClientRect();
+                  return {index:i,x:r.x,y:r.y,width:r.width,height:r.height,
+                    pixelWidth:el.width,pixelHeight:el.height};
+                });
+                let character=null, extractError=null;
+                try {
+                  const fn=window.WH?.Wow?.DressingRoom?.getCharacterForHash;
+                  if(typeof fn==='function'){
+                    const ch=fn();
+                    character=JSON.parse(JSON.stringify({settings:ch?.settings,
+                      equipment:ch?.equipment,customizations:ch?.customizations}));
+                  } else { extractError='WH.Wow.DressingRoom.getCharacterForHash not present'; }
+                }catch(e){extractError=String(e);}
+                return {url:location.href,title:document.title,hash:location.hash,
+                  canvases:c,character,extractError,
+                  visibleText:document.body?.innerText?.slice(0,2400),
+                  iframeCount:document.querySelectorAll('iframe').length};
+              });
+              data.errors=errors.slice(0,80);
+              data.failedRequests=requests.slice(0,60);
+              fs.writeFileSync(path.join(out,'character-info.json'),JSON.stringify(data,null,2));
+              const canvas = [...data.canvases].sort((a,b)=>b.width*b.height-a.width*a.height)[0];
+              if(canvas?.width>100 && canvas?.height>100){
+                try {
+                  const clip={x:Math.max(0,canvas.x),y:Math.max(0,canvas.y),
+                    width:Math.min(canvas.width,1600-Math.max(0,canvas.x)),
+                    height:Math.min(canvas.height,1100-Math.max(0,canvas.y))};
+                  if(clip.width>50 && clip.height>50)
+                    await page.screenshot({path:path.join(out,'04-character-viewer.png'),clip});
+                } catch(e){errors.push('CROP: '+e.message.slice(0,300));}
+              }
+              if(data.character) console.log('CHARACTER_INFO_JSON:',JSON.stringify(data.character).slice(0,60000));
+              console.log('EXTRACTION',JSON.stringify({title:data.title,canvasCount:data.canvases.length,
+                characterExtracted:!!data.character,extractError:data.extractError,errors:errors.slice(0,10)}));
+            } catch(e) {
+              errors.push('FATAL: '+(e.stack||e.message));
+              fs.writeFileSync(path.join(out,'errors.txt'),errors.join('\n'));
+              console.log(errors.join('\n'));
+            } finally {if(browser) await browser.close();}
+          })();
+          JS
+
+      - name: Upload screenshots and extracted data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wowhead-character-capture
+          path: wow-capture/
+          if-no-files-found: warn
+          retention-days: 7
