@@ -20,6 +20,275 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
+      - name: Decode URL and resolve appearance without the 3D viewer
+        shell: bash
+        env:
+          TARGET_URL: ${{ inputs.wowhead_url || 'https://www.wowhead.com/forever/dressing-room#fo8zk0zJ89c8zw8ud8ot8uv8zI8Gq8qs8Mse8Mtk808zu8u38zG8Gc8qE8Mbs8dY8MDy877Q4P87Mv587o' }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/wow-capture"
+          python3 - "$TARGET_URL" --output "$GITHUB_WORKSPACE/wow-capture/character-info.json" <<'PY'
+          #!/usr/bin/env python3
+          """Decode Wowhead Dressing Room v15 links without JavaScript or a 3D viewer.
+          
+          The encoding and field order were checked against Wowhead's Calc.js and
+          DressingRoom.js on 2026-10-09. Customization labels are read from Wowhead's
+          published JSON data; downloaded JavaScript is never executed.
+          """
+          import argparse
+          import json
+          import re
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+          
+          ENCODING = "0zMcmVokRsaqbdrfwihuGINALpTjnyxtgevElBCDFHJKOPQSUWXYZ123456789"
+          BASE = 58
+          DELIMITER = "8"
+          DATA_URL = "https://nether.wowhead.com/forever/data/dressing-room?dv=26&db=1791493526"
+          RACES = {1: "Human", 2: "Orc", 3: "Dwarf", 4: "Night Elf", 5: "Undead",
+                   6: "Tauren", 7: "Gnome", 8: "Troll", 9: "Goblin", 10: "Blood Elf",
+                   11: "Draenei", 22: "Worgen", 24: "Pandaren", 25: "Pandaren", 26: "Pandaren"}
+          CLASSES = {1: "Warrior", 2: "Paladin", 3: "Hunter", 4: "Rogue", 5: "Priest",
+                     6: "Death Knight", 7: "Shaman", 8: "Mage", 9: "Warlock",
+                     10: "Monk", 11: "Druid", 12: "Demon Hunter", 13: "Evoker"}
+          SLOTS = {1: "head", 2: "shoulder", 3: "back", 4: "chest", 5: "shirt",
+                   6: "tabard", 7: "wrists", 8: "hands", 9: "waist", 10: "legs",
+                   11: "feet", 12: "mainhand", 13: "offhand", 14: "ranged"}
+          
+          
+          def layout():
+              fields = [("short", ["version"]), ("long", ["settings", "race"]),
+                        ("delimiter", None)]
+              fields += [("short", ["settings", key]) for key in
+                         ("gender", "class", "specialization")]
+              fields += [("long", ["settings", "level"]), ("delimiter", None)]
+              fields += [("short", ["settings", key]) for key in ("npcOptions", "pepe")]
+              fields += [("long", ["settings", "mount"]), ("delimiter", None)]
+              for index in range(50):
+                  for key in ("optionId", "choiceId"):
+                      fields += [("long", ["custChoices", str(index), key]), ("delimiter", None)]
+              for slot in range(1, 15):
+                  keys = ["itemId", "itemBonus"] + (["enchant"] if slot in (12, 13) else [])
+                  for key in keys:
+                      fields += [("long", ["equipment", str(slot), key]), ("delimiter", None)]
+              for key in ("artifactAppearanceMainHand", "artifactAppearanceOffHand"):
+                  fields += [("short", ["settings", key]), ("delimiter", None)]
+              fields += [("short", ["settings", "separateShoulders"])]
+              return fields
+          
+          
+          def expand(text, marker, replacement):
+              result, repeats = [], 0
+              for char in text:
+                  if repeats and char == marker:
+                      repeats += 1
+                  elif repeats:
+                      count = ENCODING.index(char) + (repeats - 1) * BASE
+                      result.append(replacement * count)
+                      repeats = 0
+                  elif char == marker:
+                      repeats = 1
+                  else:
+                      result.append(char)
+              if repeats:
+                  raise ValueError("Incomplete hash compression sequence")
+              return "".join(result)
+          
+          
+          def set_value(obj, path, value):
+              for key in path[:-1]:
+                  obj = obj.setdefault(key, {})
+              obj[path[-1]] = value
+          
+          
+          def get_value(obj, path):
+              for key in path:
+                  if not isinstance(obj, dict):
+                      return 0
+                  obj = obj.get(key, 0)
+              return obj
+          
+          
+          def encode_long(value):
+              digits = [value]
+              while digits[0] > BASE:
+                  quotient, remainder = divmod(digits[0], BASE)
+                  digits[0] = remainder
+                  digits.insert(0, quotient)
+              return "".join(ENCODING[digit] for digit in digits)
+          
+          
+          def compress(text, token, marker, drop_trailing=False):
+              result, count, index = [], 0, 0
+              def flush():
+                  if count < 2:
+                      return token * count
+                  repeats, digit = divmod(count - 1, BASE)
+                  return marker * (repeats + 1) + ENCODING[digit + 1]
+              while index < len(text):
+                  if text.startswith(token, index):
+                      count += 1
+                      index += len(token)
+                  else:
+                      result.append(flush())
+                      count = 0
+                      result.append(text[index])
+                      index += 1
+              if not drop_trailing:
+                  result.append(flush())
+              return "".join(result)
+          
+          
+          def encode(raw):
+              pieces = []
+              for kind, path in layout():
+                  if kind == "delimiter":
+                      pieces.append(DELIMITER)
+                  else:
+                      value = get_value(raw, path)
+                      pieces.append(encode_long(value) if kind == "long" else ENCODING[value])
+              return compress(compress("".join(pieces), "0", "9", True), "08", "7")
+          
+          
+          def decode(url):
+              parsed = urllib.parse.urlsplit(url)
+              if parsed.scheme != "https" or parsed.hostname != "www.wowhead.com":
+                  raise ValueError("Expected an HTTPS www.wowhead.com Dressing Room URL")
+              if parsed.path != "/forever/dressing-room":
+                  raise ValueError("This extractor is for Forever Dressing Room links")
+              hash_text = urllib.parse.unquote(parsed.fragment)
+              if not hash_text or len(hash_text) > 20000:
+                  raise ValueError("Missing or oversized character hash")
+              if set(hash_text) - set(ENCODING):
+                  raise ValueError("Character hash contains unsupported characters")
+              if ENCODING.index(hash_text[0]) != 15:
+                  raise ValueError("Unsupported hash version; this extractor validates version 15")
+              remainder = expand(expand(hash_text, "9", "0"), "7", "08")
+              raw = {}
+              for kind, path in layout():
+                  if not remainder:
+                      break
+                  if kind == "delimiter":
+                      if not remainder.startswith(DELIMITER):
+                          raise ValueError("Invalid field delimiter")
+                      remainder = remainder[1:]
+                      continue
+                  size = remainder.find(DELIMITER) if kind == "long" else 1
+                  if size < 0:
+                      size = len(remainder)
+                  token, remainder = remainder[:size], remainder[size:]
+                  if not token:
+                      raise ValueError("Missing field value")
+                  value = 0
+                  for char in token:
+                      value = value * (BASE if kind == "long" else 1) + ENCODING.index(char)
+                  set_value(raw, path, value)
+              if remainder:
+                  raise ValueError("Character hash has unexpected remaining fields")
+              if encode(raw) != hash_text:
+                  raise ValueError("Hash did not pass exact decode/encode validation")
+              if raw.get("settings", {}).get("gender") not in (0, 1):
+                  raise ValueError("Unsupported character body value")
+              return raw
+          
+          
+          def parse_page_data(text):
+              result = {}
+              for match in re.finditer(r"WH\.setPageData\('([^']+)',\s*", text):
+                  result[match.group(1)], _ = json.JSONDecoder().raw_decode(text[match.end():])
+              if "wow.dressingRoom.customizationOptions" not in result:
+                  raise ValueError("Customization data was not present in the response")
+              return result
+          
+          
+          def enrich(raw, data):
+              settings = dict(raw["settings"])
+              selected = {value["optionId"]: value["choiceId"]
+                          for value in raw.get("custChoices", {}).values() if value["optionId"]}
+              model = data["wow.dressingRoom.raceGenderMap"].get(str(settings["race"]), {}).get(str(settings["gender"]))
+              if model is None:
+                  raise ValueError("No customization model found for this race and body")
+              all_options = data["wow.dressingRoom.customizationOptions"]
+              options = list(all_options.get(str(model), []))
+              for category in data.get("wow.dressingRoom.conditionalCategories", []):
+                  if category.get("requiredRaces") and settings["race"] not in category["requiredRaces"]:
+                      continue
+                  mask = category.get("classMask", 0)
+                  if category.get("requirementType", 0) & 1 and mask and not mask & (1 << (settings["class"] - 1)):
+                      continue
+                  options += [item for item in all_options.get(str(category["model"]), [])
+                              if item["category"] == category["category"]]
+              resolved = []
+              for option in options:
+                  choice_id = selected.get(option["id"], 0)
+                  match = next((choice for choice in option["choices"] if choice["id"] == choice_id), None)
+                  entry = {"optionId": option["id"], "optionName": option["name"],
+                           "slug": option["slug"], "choiceId": choice_id}
+                  if match is None:
+                      entry["status"] = "not_specified"
+                      if all((choice.get("requirementType", 0) & 3) == 2 for choice in option["choices"]) and not settings.get("npcOptions"):
+                          entry["status"] = "npc_option_disabled"
+                  else:
+                      entry.update({"status": "encoded_choice", "choiceName": match.get("name") or None,
+                                    "dataIndex": option["choices"].index(match) + 1,
+                                    "choiceMetadata": match})
+                      if match.get("color"):
+                          entry["colorSwatch"] = "#" + match["color"]
+                      settings[option["slug"]] = choice_id
+                  resolved.append(entry)
+              unknown = set(selected) - {option["id"] for option in options}
+              if unknown:
+                  raise ValueError("Encoded customization options were absent from current metadata: " + str(sorted(unknown)))
+              return {"settings": settings, "modelId": model, "customizations": resolved}
+          
+          
+          def main():
+              parser = argparse.ArgumentParser(description=__doc__)
+              parser.add_argument("url")
+              parser.add_argument("--output", default="character-info.json")
+              parser.add_argument("--metadata", help="Optional cached JSON metadata from this extractor")
+              args = parser.parse_args()
+              raw = decode(args.url)
+              settings = raw["settings"]
+              result = {"sourceUrl": args.url, "extractedAt": datetime.now(timezone.utc).isoformat(),
+                        "hashVersion": raw["version"], "hashRoundTripVerified": True,
+                        "race": {"id": settings["race"], "name": RACES.get(settings["race"], "Race " + str(settings["race"]))},
+                        "body": {"id": settings["gender"], "name": "Female" if settings["gender"] else "Male",
+                                 "wowheadLabel": "Body 2" if settings["gender"] else "Body 1"},
+                        "class": {"id": settings["class"], "name": CLASSES.get(settings["class"], "Class " + str(settings["class"]))},
+                        "settings": settings, "encodedChoices": [item for item in raw.get("custChoices", {}).values() if item["optionId"]],
+                        "equipment": [{"paperdollSlot": int(slot), "slotName": SLOTS[int(slot)], **item}
+                                      for slot, item in raw.get("equipment", {}).items() if item.get("itemId")],
+                        "render": {"attempted": False, "modelImageVerified": False},
+                        "notes": ["Color swatches are Wowhead option metadata, not sampled texture pixels.",
+                                  "Viewer scale level is metadata; it is not the character's game level.",
+                                  "An absent NPC-only option is left disabled rather than guessed."]}
+              try:
+                  if args.metadata:
+                      data = json.loads(Path(args.metadata).read_text())
+                  else:
+                      with urllib.request.urlopen(DATA_URL, timeout=25) as response:
+                          data = parse_page_data(response.read(8000000).decode("utf-8"))
+                  result.update(enrich(raw, data))
+                  result["metadataStatus"] = "resolved"
+                  result["metadataSource"] = DATA_URL
+              except Exception as error:
+                  result["metadataStatus"] = "unavailable"
+                  result["metadataError"] = str(error)
+              output = Path(args.output)
+              output.parent.mkdir(parents=True, exist_ok=True)
+              output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+              print("CHARACTER_INFO_JSON:", json.dumps(result, ensure_ascii=False))
+              print("URL_DECODE:", json.dumps({"hashValidated": True, "metadataStatus": result["metadataStatus"],
+                                              "race": result["race"]["name"], "body": result["body"]["name"],
+                                              "class": result["class"]["name"]}))
+          
+          
+          if __name__ == "__main__":
+              main()
+          PY
+
       - name: Install Playwright and Chromium
         shell: bash
         run: |
@@ -29,7 +298,7 @@ jobs:
           npm install --no-fund --no-audit playwright@1.55.1
           npx playwright install --with-deps chromium
 
-      - name: Capture viewer and extract character settings
+      - name: Attempt the 3D capture and report its actual result
         shell: bash
         env:
           TARGET_URL: ${{ inputs.wowhead_url || 'https://www.wowhead.com/forever/dressing-room#fo8zk0zJ89c8zw8ud8ot8uv8zI8Gq8qs8Mse8Mtk808zu8u38zG8Gc8qE8Mbs8dY8MDy877Q4P87Mv587o' }}
@@ -40,77 +309,64 @@ jobs:
           const fs = require('fs');
           const path = require('path');
           const out = path.join(process.env.GITHUB_WORKSPACE, 'wow-capture');
-          fs.mkdirSync(out, {recursive: true});
-          const url = process.env.TARGET_URL;
-          const errors = [], requests = [];
-          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+          const infoPath = path.join(out, 'character-info.json');
+          const info = JSON.parse(fs.readFileSync(infoPath, 'utf8'));
+          const render = {attempted:true, modelImageVerified:false, captureAvailable:false, errors:[], failedRequests:[]};
           (async () => {
-            let browser;
+            let browser, page;
             try {
-              browser = await chromium.launch({headless:true, args:[
-                '--enable-webgl', '--ignore-gpu-blocklist',
-                '--use-gl=angle', '--use-angle=swiftshader',
-                '--enable-unsafe-swiftshader', '--disable-dev-shm-usage'
+              browser = await chromium.launch({headless:true,args:[
+                '--enable-webgl','--ignore-gpu-blocklist','--use-gl=angle',
+                '--use-angle=swiftshader','--enable-unsafe-swiftshader','--disable-dev-shm-usage'
               ]});
-              const context = await browser.newContext({
-                viewport:{width:1600,height:1100},deviceScaleFactor:1,
-                locale:'en-US'
-              });
-              const page = await context.newPage();
-              page.on('console', m => {if(m.type()==='error') errors.push(m.text().slice(0,400));});
-              page.on('pageerror', e => errors.push('PAGE: '+e.message.slice(0,400)));
-              page.on('requestfailed', r => requests.push({url:r.url().slice(0,250),error:r.failure()?.errorText}));
-              page.on('response', r => {if(r.status()>=400) requests.push({url:r.url().slice(0,250),status:r.status()});});
-              try { await page.goto(url, {waitUntil:'domcontentloaded',timeout:75000}); }
-              catch(e){ errors.push('NAVIGATION: '+e.message.slice(0,500)); }
-
-              for (const [i,ms] of [12000,20000,20000].entries()) {
-                await sleep(ms);
-                try {await page.screenshot({path:path.join(out,`0${i+1}-page.png`),fullPage:false,timeout:15000});}
-                catch(e){errors.push('SCREENSHOT: '+e.message.slice(0,300));}
-              }
-
-              const data = await page.evaluate(() => {
-                const c = [...document.querySelectorAll('canvas')].map((el,i)=>{
-                  const r=el.getBoundingClientRect();
-                  return {index:i,x:r.x,y:r.y,width:r.width,height:r.height,
-                    pixelWidth:el.width,pixelHeight:el.height};
-                });
-                let character=null, extractError=null;
-                try {
-                  const fn=window.WH?.Wow?.DressingRoom?.getCharacterForHash;
-                  if(typeof fn==='function'){
-                    const ch=fn();
-                    character=JSON.parse(JSON.stringify({settings:ch?.settings,
-                      equipment:ch?.equipment,customizations:ch?.customizations}));
-                  } else { extractError='WH.Wow.DressingRoom.getCharacterForHash not present'; }
-                }catch(e){extractError=String(e);}
-                return {url:location.href,title:document.title,hash:location.hash,
-                  canvases:c,character,extractError,
-                  visibleText:document.body?.innerText?.slice(0,2400),
-                  iframeCount:document.querySelectorAll('iframe').length};
-              });
-              data.errors=errors.slice(0,80);
-              data.failedRequests=requests.slice(0,60);
-              fs.writeFileSync(path.join(out,'character-info.json'),JSON.stringify(data,null,2));
-              const canvas = [...data.canvases].sort((a,b)=>b.width*b.height-a.width*a.height)[0];
-              if(canvas?.width>100 && canvas?.height>100){
-                try {
-                  const clip={x:Math.max(0,canvas.x),y:Math.max(0,canvas.y),
-                    width:Math.min(canvas.width,1600-Math.max(0,canvas.x)),
-                    height:Math.min(canvas.height,1100-Math.max(0,canvas.y))};
-                  if(clip.width>50 && clip.height>50)
-                    await page.screenshot({path:path.join(out,'04-character-viewer.png'),clip});
-                } catch(e){errors.push('CROP: '+e.message.slice(0,300));}
-              }
-              if(data.character) console.log('CHARACTER_INFO_JSON:',JSON.stringify(data.character).slice(0,60000));
-              console.log('EXTRACTION',JSON.stringify({title:data.title,canvasCount:data.canvases.length,
-                characterExtracted:!!data.character,extractError:data.extractError,errors:errors.slice(0,10)}));
+              const context = await browser.newContext({viewport:{width:1600,height:1100},deviceScaleFactor:1,locale:'en-US'});
+              page = await context.newPage();
+              page.on('pageerror', e => render.errors.push(e.message.slice(0,500)));
+              page.on('requestfailed', r => render.failedRequests.push({url:r.url().slice(0,250),error:r.failure()?.errorText}));
+              const response = await page.goto(process.env.TARGET_URL,{waitUntil:'domcontentloaded',timeout:60000});
+              render.httpStatus = response?.status();
+              render.title = await page.title();
+              render.url = page.url();
+              if (!response || response.status() >= 400) throw new Error('Viewer page returned HTTP '+render.httpStatus);
+              await page.getByRole('button',{name:'Reject All',exact:true}).click({timeout:3000}).catch(()=>{});
+              const viewer = page.locator('#dressing-room .dressing-room-character .paperdoll');
+              const canvas = viewer.locator('canvas').first();
+              await canvas.waitFor({state:'visible',timeout:35000});
+              await viewer.scrollIntoViewIfNeeded();
+              const pause = page.locator('#dr-pause');
+              if (await pause.isVisible()) await pause.click().catch(()=>{});
+              await page.waitForTimeout(8000);
+              render.canvasCount = await viewer.locator('canvas').count();
+              if (render.errors.some(e=>/setAdaptiveMode/.test(e))) throw new Error('The 3D renderer did not initialize');
+              await viewer.screenshot({path:path.join(out,'character-viewer.png'),timeout:15000});
+              render.captureAvailable = true;
+              render.captureFile = 'character-viewer.png';
+              render.note = 'The PNG must be inspected before declaring the character model visually verified.';
             } catch(e) {
-              errors.push('FATAL: '+(e.stack||e.message));
-              fs.writeFileSync(path.join(out,'errors.txt'),errors.join('\n'));
-              console.log(errors.join('\n'));
-            } finally {if(browser) await browser.close();}
+              render.failureReason = e.message;
+              if (page) {
+                render.title = await page.title().catch(()=>render.title);
+                render.url = page.url();
+                await page.screenshot({path:path.join(out,'diagnostic-page.png'),timeout:10000}).catch(()=>{});
+              }
+            } finally {
+              render.errors = render.errors.slice(0,30);
+              render.failedRequests = render.failedRequests.slice(0,30);
+              info.render = render;
+              fs.writeFileSync(infoPath,JSON.stringify(info,null,2));
+              fs.writeFileSync(path.join(out,'render-info.json'),JSON.stringify(render,null,2));
+              console.log('VIEWER_RESULT_JSON:',JSON.stringify(render));
+              if (process.env.GITHUB_STEP_SUMMARY) {
+                fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY,
+                  '# Wowhead result\n\n'+
+                  '- URL data: decoded and exact hash round trip verified.\n'+
+                  '- Character: '+info.race.name+' '+info.body.name+' '+info.class.name+'.\n'+
+                  '- Customization labels: '+info.metadataStatus+'.\n'+
+                  '- 3D capture: '+(render.captureAvailable?'PNG saved; visual inspection required.':'unavailable: '+render.failureReason)+'.\n'+
+                  '\nA successful data extraction does not imply a successful 3D capture.\n');
+              }
+              if(browser) await browser.close();
+            }
           })();
           JS
 
